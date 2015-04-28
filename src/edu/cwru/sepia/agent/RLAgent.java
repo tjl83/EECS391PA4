@@ -3,12 +3,14 @@ package edu.cwru.sepia.agent;
 import edu.cwru.sepia.action.Action;
 import edu.cwru.sepia.action.ActionFeedback;
 import edu.cwru.sepia.action.ActionResult;
+import edu.cwru.sepia.action.ActionType;
 import edu.cwru.sepia.action.TargetedAction;
 import edu.cwru.sepia.environment.model.history.DamageLog;
 import edu.cwru.sepia.environment.model.history.DeathLog;
 import edu.cwru.sepia.environment.model.history.History;
 import edu.cwru.sepia.environment.model.state.State;
 import edu.cwru.sepia.environment.model.state.Unit;
+import edu.cwru.sepia.environment.model.state.Unit.UnitView;
 
 import java.io.*;
 import java.util.*;
@@ -182,6 +184,7 @@ public class RLAgent extends Agent {
      * @return The updated weight vector.
      */
     public double[] updateWeights(double[] oldWeights, double[] oldFeatures, double totalReward, State.StateView stateView, History.HistoryView historyView, int footmanId) {
+    	
         return null;
     }
 
@@ -232,7 +235,33 @@ public class RLAgent extends Agent {
      * @return The current reward
      */
     public double calculateReward(State.StateView stateView, History.HistoryView historyView, int footmanId) {
-        return 0;
+    	double reward = 0.0;
+    	
+    	int lastTurnNumber = stateView.getTurnNumber() - 1;
+    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(playernum, lastTurnNumber);
+    	Action footmanAction = commandsIssued.get(footmanId);
+    	footmanAction.toString();
+    	
+    	for(DamageLog damageLog : historyView.getDamageLogs(lastTurnNumber)) {
+    		if(damageLog.getAttackerID() == footmanId){
+    			reward += damageLog.getDamage();
+    		}
+    		if(damageLog.getDefenderID() == footmanId){
+    			reward -= damageLog.getDamage();
+    		}
+    	}
+    	
+    	for(DeathLog deathLog : historyView.getDeathLogs(lastTurnNumber)) {
+    		if(deathLog.getDeadUnitID() == footmanId){
+    			reward -= 100;
+    		}
+    	}
+    	
+    	if(commandsIssued.containsKey(footmanId)){
+    		reward -= 0.1;
+    	}
+    	
+        return reward;
     }
 
     /**
@@ -253,7 +282,14 @@ public class RLAgent extends Agent {
                              History.HistoryView historyView,
                              int attackerId,
                              int defenderId) {
-        return 0;
+    	double qValue = 0.0;
+    	double[] featureVector = calculateFeatureVector(stateView, historyView, attackerId, defenderId);
+    	
+    	for(int i = 0; i < featureVector.length; i++){
+    		qValue += this.weights[i] * featureVector[i];
+    	}
+    	
+        return qValue;
     }
 
     /**
@@ -277,7 +313,138 @@ public class RLAgent extends Agent {
                                            History.HistoryView historyView,
                                            int attackerId,
                                            int defenderId) {
-        return null;
+    	ArrayList<Double> featureVector = new ArrayList<Double>();
+    	
+    	double constant = 0.0;
+    	featureVector.add(constant);
+    	
+    	double distanceFeature = calculateDistanceFeature(stateView, historyView, attackerId, defenderId);
+    	featureVector.add(distanceFeature);
+    	double healthFeature = calculateHealthFeature(stateView, historyView, attackerId, defenderId);
+    	featureVector.add(healthFeature);
+    	double numbersFeature = calculateNumbersFeature(stateView, historyView, attackerId, defenderId);
+    	featureVector.add(numbersFeature);
+    	double isAttackingSelfFeature = calculateIsAttackingSelfFeature(stateView, historyView, attackerId, defenderId);
+    	featureVector.add(isAttackingSelfFeature);
+    	
+    	if(featureVector.size() == this.weights.length)
+    		return toPrimitive(featureVector);
+    	else{
+    		System.err.println("Feature Vector dimension does not match Weights");
+    		System.exit(1);
+    		return null;
+    	}
+    }
+    
+    /**
+     * Simple helper function that returns the primitive array of an ArrayList of Doubles
+     * @param arraylist
+     * @return A primitive double array of the ArrayList<Double> input
+     */
+    private double[] toPrimitive(ArrayList<Double> arraylist){
+    	double[] ret = new double[arraylist.size()];
+        Iterator<Double> iterator = arraylist.iterator();
+        for (int i = 0; i < ret.length; i++)
+        {
+            ret[i] = iterator.next().intValue();
+        }
+        return ret;
+    }
+    
+    /**
+     * This returns the feature representing the Chebyshev Distance between the ally footman and the enemy footman.
+     * 
+     * @param stateView Current state of the SEPIA game
+     * @param historyView History of the game up until this turn
+     * @param attackerId Your footman. The one doing the attacking.
+     * @param defenderId An enemy footman. The one you are considering attacking.
+     * @return The distance feature to be used in calculating the Q-Value.
+     */
+    private double calculateDistanceFeature(State.StateView stateView,
+                                           History.HistoryView historyView,
+                                           int attackerId,
+                                           int defenderId) {
+    	double distanceFeature = 0.0;
+    	
+    	UnitView attacker = stateView.getUnit(attackerId);
+    	UnitView defender = stateView.getUnit(defenderId);
+
+        distanceFeature = Math.max(Math.abs(attacker.getXPosition() - defender.getXPosition()), Math.abs(attacker.getYPosition() - defender.getYPosition()));
+    	
+    	return distanceFeature;
+    }
+    
+    /**
+     * This returns the feature representing the health ratio between the ally footman and the enemy footman.
+     * 
+     * @param stateView Current state of the SEPIA game
+     * @param historyView History of the game up until this turn
+     * @param attackerId Your footman. The one doing the attacking.
+     * @param defenderId An enemy footman. The one you are considering attacking.
+     * @return The health feature to be used in calculating the Q-Value.
+     */
+    private double calculateHealthFeature(State.StateView stateView,
+                                           History.HistoryView historyView,
+                                           int attackerId,
+                                           int defenderId) {
+    	double healthFeature = 0.0;
+    	
+    	UnitView attacker = stateView.getUnit(attackerId);
+    	UnitView defender = stateView.getUnit(defenderId);
+    	
+    	healthFeature = ((double)attacker.getHP()) / ((double)defender.getHP());
+    	
+    	return healthFeature;
+    }
+    
+    /**
+     * This returns the feature representing the number of ally footmen currently attacking your footman's desginated target enemy footman.
+     * 
+     * @param stateView Current state of the SEPIA game
+     * @param historyView History of the game up until this turn
+     * @param attackerId Your footman. The one doing the attacking.
+     * @param defenderId An enemy footman. The one you are considering attacking.
+     * @return The numbers feature to be used in calculating the Q-Value.
+     */
+    private double calculateNumbersFeature(State.StateView stateView,
+                                           History.HistoryView historyView,
+                                           int attackerId,
+                                           int defenderId) {
+    	double numbersFeature = 0.0;
+
+    	int lastTurnNumber = stateView.getTurnNumber() - 1;
+    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(this.ENEMY_PLAYERNUM, lastTurnNumber);
+    	
+    	for(Integer myFootman:this.myFootmen){
+    		Action action = commandsIssued.get(myFootman);
+    		action.toString();
+    	}
+    	
+    	return numbersFeature;
+    }
+    
+    /**
+     * This returns the feature representing whether or not your footman's designated target enemy footman is currently attacking your footman.
+     * 
+     * @param stateView Current state of the SEPIA game
+     * @param historyView History of the game up until this turn
+     * @param attackerId Your footman. The one doing the attacking.
+     * @param defenderId An enemy footman. The one you are considering attacking.
+     * @return The feature, representing whether or not the target enemy is targeting your ally, to be used in calculating the Q-Value.
+     */
+    private double calculateIsAttackingSelfFeature(State.StateView stateView,
+                                           History.HistoryView historyView,
+                                           int attackerId,
+                                           int defenderId) {
+    	double isAttackingSelfFeature = 0.0;
+
+    	int turnNumber = stateView.getTurnNumber();
+    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(this.ENEMY_PLAYERNUM, turnNumber);
+    	for(Map.Entry<Integer, Action> commandEntry : commandsIssued.entrySet()) {
+    		System.out.println("Unit " + commandEntry.getKey() + " was commanded to " + commandEntry.getValue().toString());
+    	}
+    	
+    	return isAttackingSelfFeature;
     }
 
     /**
