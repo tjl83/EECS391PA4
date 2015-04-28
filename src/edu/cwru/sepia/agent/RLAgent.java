@@ -3,7 +3,6 @@ package edu.cwru.sepia.agent;
 import edu.cwru.sepia.action.Action;
 import edu.cwru.sepia.action.ActionFeedback;
 import edu.cwru.sepia.action.ActionResult;
-import edu.cwru.sepia.action.ActionType;
 import edu.cwru.sepia.action.TargetedAction;
 import edu.cwru.sepia.environment.model.history.DamageLog;
 import edu.cwru.sepia.environment.model.history.DeathLog;
@@ -15,20 +14,71 @@ import edu.cwru.sepia.environment.model.state.Unit.UnitView;
 import java.io.*;
 import java.util.*;
 
+
 public class RLAgent extends Agent {
 
     /**
+	 * 
+	 */
+	private static final long serialVersionUID = 1L;
+	/**
      * Set in the constructor. Defines how many learning episodes your agent should run for.
      * When starting an episode. If the count is greater than this value print a message
      * and call sys.exit(0)
      */
     public final int numEpisodes;
-
+    
+    /**
+     * This is the number of learning episodes to run, set to 10 as was given by assignment
+     */
+    private final int numLearningEpisodes = 10;
+    /**
+     * This is the number of testing (evaluation) episodes to run, set to 5 as was given by assignment
+     */
+    private final int numTestingEpisodes = 5;
+    /**
+     * Total number of episodes played so far
+     */
+    private int episodesPlayed = 0;
+    
+    private enum Mode{
+    	LEARNING,
+    	TESTING;
+    }
+    
+    /**
+     * This returns whether the current episode is learning or testing the weights
+     * @return The current episode mode, LEARNING or TESTING.
+     */
+    private Mode currentMode(){
+    	// Learing happens between the number of learning episodes and after the number of testing episodes
+    	// (e.g. with 10 learning: 0 - 9, 15 - 24, ...)
+    	// Testing happens between the number of testing episodes and after the number of learning episodes
+    	// (e.g. with 5 testing: 10 - 14, 25 - 29, ...)
+    	
+    	// The pattern repeats after every (#learning + #testing) episodes
+    	int value = (this.episodesPlayed % (this.numLearningEpisodes + this.numTestingEpisodes));
+    	
+    	//  0-9 given 10 learning episodes
+    	if(value < this.numLearningEpisodes)
+    		return Mode.LEARNING;
+    	// 10-14 given 5 testing episodes
+    	else
+    		return Mode.TESTING;
+    }
+    
+    // Stores the cumulative reward for each test episode during testing
+    private List<Double> testingRewards;
+    // Stores the average cumulative reward for each set of testing episodes
+    private List<Double> averageCumulativeRewards;
+    // Maps each footman ID with its associated cummulative reward
+    private Map<Integer, Double> footmenRewards;
     /**
      * List of your footmen and your enemies footmen
      */
     private List<Integer> myFootmen;
     private List<Integer> enemyFootmen;
+    private Set<Integer> eliminatedEnemyFootmen;
 
     /**
      * Convenience variable specifying enemy agent number. Use this whenever referring
@@ -87,6 +137,8 @@ public class RLAgent extends Agent {
                 weights[i] = random.nextDouble() * 2 - 1;
             }
         }
+    	testingRewards = new LinkedList<Double>();
+    	averageCumulativeRewards = new LinkedList<Double>();
     }
 
     /**
@@ -96,7 +148,12 @@ public class RLAgent extends Agent {
     public Map<Integer, Action> initialStep(State.StateView stateView, History.HistoryView historyView) {
 
         // You will need to add code to check if you are in a testing or learning episode
+    	// This is handled with the method defined at the top of this file - currentMode()
+    	
+    	eliminatedEnemyFootmen = new HashSet<Integer>();
+    	footmenRewards = new HashMap<Integer, Double>();
 
+    	
         // Find all of your units
         myFootmen = new LinkedList<>();
         for (Integer unitId : stateView.getUnitIds(playernum)) {
@@ -105,6 +162,7 @@ public class RLAgent extends Agent {
             String unitName = unit.getTemplateView().getName().toLowerCase();
             if (unitName.equals("footman")) {
                 myFootmen.add(unitId);
+                footmenRewards.put(unitId, 0.0);
             } else {
                 System.err.println("Unknown unit type: " + unitName);
             }
@@ -141,7 +199,7 @@ public class RLAgent extends Agent {
      *
      * You should also check for completed actions using the history view. Obviously you never want a footman just
      * sitting around doing nothing (the enemy certainly isn't going to stop attacking). So at the minimum you will
-     * have an even whenever one your footmen's targets is killed or an action fails. Actions may fail if the target
+     * have an event occur whenever one your footmen's targets is killed or an action fails. Actions may fail if the target
      * is surrounded or the unit cannot find a path to the unit. To get the action results from the previous turn
      * you can do something similar to the following. Please be aware that on the first turn you should not call this
      *
@@ -154,7 +212,55 @@ public class RLAgent extends Agent {
      */
     @Override
     public Map<Integer, Action> middleStep(State.StateView stateView, History.HistoryView historyView) {
-        return null;
+    	updateFootmenRewards(stateView, historyView);
+    	removeDeadUnits(stateView, historyView);
+    	
+    	Map<Integer, Action> actions = new HashMap<Integer, Action>();
+    	
+    	if(eventOccured(stateView, historyView)){
+    		for(int attackerId : this.myFootmen){
+    			int defenderId = selectAction(stateView, historyView, attackerId);
+    			
+    			if(currentMode().equals(Mode.LEARNING)){
+    				Double[] oldWeights = this.weights;
+    				double[] oldFeatures = this.calculateFeatureVector(stateView, historyView, attackerId, defenderId);
+    				double totalReward = this.footmenRewards.get(attackerId);
+    				this.weights = this.updateWeights(oldWeights, oldFeatures, totalReward, stateView, historyView, attackerId);
+    			}
+    			
+    			actions.put(attackerId, Action.createCompoundAttack(attackerId, defenderId));
+    		}
+    	}
+    	
+        return actions;
+    }
+    
+    /**
+     * Determines if an event has occurred.
+     * @param stateView
+     * @param historyView
+     * @return
+     */
+    private boolean eventOccured(State.StateView stateView, History.HistoryView historyView){
+    	if(stateView.getTurnNumber() == 0)
+        	// The episode begins
+    		return true;
+    	
+    	int lastTurnNumber = stateView.getTurnNumber() - 1;
+    	
+    	List<DeathLog> deathLogs = historyView.getDeathLogs(lastTurnNumber);
+    	if(deathLogs.size() > 0)
+        	// If a death occurs...
+    		return true;
+    	
+    	Map<Integer, ActionResult> actionResults = historyView.getCommandFeedback(this.playernum, lastTurnNumber);
+    	for(ActionResult actionResult : actionResults.values()){
+    		if(!actionResult.getFeedback().equals(ActionFeedback.INCOMPLETE))
+        		// Either the action was completed or it failed if it isn't incomplete
+    			return true;
+    	}
+    	
+    	return false;
     }
 
     /**
@@ -165,12 +271,75 @@ public class RLAgent extends Agent {
      */
     @Override
     public void terminalStep(State.StateView stateView, History.HistoryView historyView) {
+    	updateFootmenRewards(stateView, historyView);
+    	removeDeadUnits(stateView, historyView);
 
-        // MAKE SURE YOU CALL printTestData after you finish a test episode.
-
+		if (myFootmen.size() == 0) {
+			System.out.println("You Lose. Enemy has " + enemyFootmen.size() + " footmen remaining");
+		}
+		else if (enemyFootmen.size() == 0) {
+			System.out.println("You Win. You have " + myFootmen.size() + " footmen remaining");
+		}
+		else {
+			System.err.println("ERROR: Winner unknown");
+		}
+		
+    	switch(currentMode()){
+	    	case LEARNING:
+	    		System.out.println("Finished Learning Episode");
+	    		
+	    		break;
+	    	case TESTING:
+	    		System.out.println("Finished Testing Episode");
+	    		Double sum = 0.0;
+	    		for(Double reward : this.footmenRewards.values()){
+	    			sum += reward;
+	    		}
+	    		this.testingRewards.add(sum);
+	    		
+	            // MAKE SURE YOU CALL printTestData after you finish a set of test episodes.
+	    		if(this.testingRewards.size() == this.numTestingEpisodes){
+	    			Double averageCumulativeReward = 0.0;
+	    			for(Double cumulativeReward : testingRewards){
+	    				averageCumulativeReward += cumulativeReward;
+	    			}
+	    			averageCumulativeReward /= (double)this.testingRewards.size();
+	    			testingRewards = new LinkedList<Double>();
+	    			averageCumulativeRewards.add(averageCumulativeReward);
+		    		printTestData(averageCumulativeRewards);
+	    		}
+	    		break;
+    		default:
+    			break;
+    	}
+    	this.episodesPlayed++;
+    	
+    	if (this.episodesPlayed > numEpisodes){
+    		System.out.println("Session Complete");
+    		System.exit(0);
+    	}
+    	
         // Save your weights
         saveWeights(weights);
 
+    }
+    
+    private void removeDeadUnits(State.StateView stateView, History.HistoryView historyView){
+    	if(stateView.getTurnNumber() > 0){
+    		int lastTurnNumber = stateView.getTurnNumber() - 1;
+        	for(DeathLog deathLog : historyView.getDeathLogs(lastTurnNumber)) {
+    			Integer unitId = new Integer(deathLog.getDeadUnitID());
+        		if(deathLog.getController() == this.playernum){
+        			this.myFootmen.remove(unitId);
+        		}
+        		else if(deathLog.getController() == this.ENEMY_PLAYERNUM){
+        			this.enemyFootmen.remove(unitId);
+        		}
+        		else{
+        			System.out.println("Phantom player?");
+        		}
+        	}
+    	}
     }
 
     /**
@@ -183,9 +352,28 @@ public class RLAgent extends Agent {
      * @param footmanId The footman we are updating the weights for
      * @return The updated weight vector.
      */
-    public double[] updateWeights(double[] oldWeights, double[] oldFeatures, double totalReward, State.StateView stateView, History.HistoryView historyView, int footmanId) {
-    	
-        return null;
+    public Double[] updateWeights(Double[] oldWeights, double[] oldFeatures, double totalReward, State.StateView stateView, History.HistoryView historyView, int footmanId) {
+    	Double[] updatedWeightVector = new Double[oldWeights.length];
+
+		double currentQVal = 0;
+		for (int j = 0; j < oldFeatures.length; j++) {
+			currentQVal += oldFeatures[j] * oldWeights[j];
+		}
+
+		double maxQVal = Double.NEGATIVE_INFINITY;
+		for (Integer enemyFootmanId : enemyFootmen) {
+			double qVal = calcQValue(stateView, historyView, footmanId, enemyFootmanId);
+			if (qVal > maxQVal) {
+				maxQVal = qVal;
+			}
+		}
+		
+		for (int i = 0; i < oldWeights.length; i++) {
+			double targetQVal = totalReward + gamma * maxQVal;
+			double dldw = -1 * (targetQVal - currentQVal) * oldFeatures[i];
+			updatedWeightVector[i] = oldWeights[i] - learningRate * (dldw);
+		}
+		return updatedWeightVector;
     }
 
     /**
@@ -198,7 +386,55 @@ public class RLAgent extends Agent {
      * @return The enemy footman ID this unit should attack
      */
     public int selectAction(State.StateView stateView, History.HistoryView historyView, int attackerId) {
-        return -1;
+    	int defenderId = -1;
+    	
+    	switch(this.currentMode()){
+	    	case LEARNING:
+	    		// Execute a random action with probability epsilon
+	    		if(random.nextDouble() < epsilon){
+					int index = (int) random.nextDouble() * enemyFootmen.size();
+					defenderId = this.enemyFootmen.get(index);
+	    			break;
+	    		}
+	    		// Otherwise follow the action recommended by the current policy
+	    	case TESTING:
+	    		double currQValue;
+		    	double maxQValue = Double.MIN_VALUE;
+		    	for(int possibleDefenderId : this.enemyFootmen){
+		    		currQValue = calcQValue(stateView, historyView, attackerId, possibleDefenderId);
+		    		if(currQValue > maxQValue){
+		    			maxQValue = currQValue;
+		    			defenderId = possibleDefenderId;
+		    		}
+		    	}
+				break;
+    		default:
+    			System.out.println("No enemies left to attack");
+    			break;
+    	}
+    	
+    	return defenderId;
+    }
+    
+    /**
+     * Updates the rewards for each footman.
+     * @param stateView
+     * @param historyView
+     */
+    private void updateFootmenRewards(State.StateView stateView, History.HistoryView historyView){
+    	if(stateView.getTurnNumber() > 0){
+    		Iterator<Integer> iter = this.myFootmen.iterator();
+    		Integer footmanId;
+    		while(iter.hasNext()){
+    			footmanId = iter.next();
+
+	    		double currentReward = calculateReward(stateView, historyView, footmanId);
+	    		double oldCumulativeReward = this.footmenRewards.get(footmanId);
+	    		double newCumulativeReward = oldCumulativeReward + currentReward;
+	    		this.footmenRewards.put(footmanId, newCumulativeReward);
+	    		
+    		}
+    	}
     }
 
     /**
@@ -238,10 +474,7 @@ public class RLAgent extends Agent {
     	double reward = 0.0;
     	
     	int lastTurnNumber = stateView.getTurnNumber() - 1;
-    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(playernum, lastTurnNumber);
-    	Action footmanAction = commandsIssued.get(footmanId);
-    	footmanAction.toString();
-    	
+
     	for(DamageLog damageLog : historyView.getDamageLogs(lastTurnNumber)) {
     		if(damageLog.getAttackerID() == footmanId){
     			reward += damageLog.getDamage();
@@ -252,13 +485,36 @@ public class RLAgent extends Agent {
     	}
     	
     	for(DeathLog deathLog : historyView.getDeathLogs(lastTurnNumber)) {
+    		// If this footman has died, 
     		if(deathLog.getDeadUnitID() == footmanId){
     			reward -= 100;
     		}
+    		// If the reward for killing it's targeted enemy is already claimed, this footman cannot claim it.
+    		if(deathLog.getController() == this.ENEMY_PLAYERNUM){
+    			Map<Integer, ActionResult> actionResults = historyView.getCommandFeedback(this.playernum, lastTurnNumber);
+    			if(actionResults.containsKey(new Integer(footmanId))){
+    				TargetedAction action = (TargetedAction) actionResults.get(footmanId).getAction();
+    				Integer defenderId = action.getTargetId();
+            		if(	!this.eliminatedEnemyFootmen.contains(new Integer(defenderId)) &&
+            				deathLog.getDeadUnitID() == defenderId) {
+                			this.eliminatedEnemyFootmen.add(new Integer(defenderId));
+                			reward += 100;
+            		}
+    			}
+    		}
     	}
-    	
-    	if(commandsIssued.containsKey(footmanId)){
-    		reward -= 0.1;
+
+    	// If a command was issued last turn, check if the same command was issued the turn before (an attack targeting the same target)
+    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(playernum, lastTurnNumber);
+    	Map<Integer, Action> commandsIssuedBeforeLast = historyView.getCommandsIssued(playernum, lastTurnNumber - 1);
+    	if(commandsIssued.containsKey(footmanId) && commandsIssuedBeforeLast.containsKey(footmanId)){
+    		TargetedAction commandIssued = (TargetedAction) commandsIssued.get(footmanId);
+    		int enemyFootmanId = commandIssued.getTargetId();
+    		TargetedAction commandIssuedBeforeLast = (TargetedAction) commandsIssued.get(footmanId);
+    		int enemyFootmanIdBeforeLast = commandIssuedBeforeLast.getTargetId();
+    		
+    		if(enemyFootmanId != enemyFootmanIdBeforeLast)
+    			reward -= 0.1;
     	}
     	
         return reward;
@@ -313,42 +569,22 @@ public class RLAgent extends Agent {
                                            History.HistoryView historyView,
                                            int attackerId,
                                            int defenderId) {
-    	ArrayList<Double> featureVector = new ArrayList<Double>();
+    	double[] featureVector = new double[RLAgent.NUM_FEATURES];
     	
     	double constant = 0.0;
-    	featureVector.add(constant);
+    	featureVector[0] = constant;
     	
     	double distanceFeature = calculateDistanceFeature(stateView, historyView, attackerId, defenderId);
-    	featureVector.add(distanceFeature);
+    	featureVector[1] = distanceFeature;
     	double healthFeature = calculateHealthFeature(stateView, historyView, attackerId, defenderId);
-    	featureVector.add(healthFeature);
+    	featureVector[2] = healthFeature;
     	double numbersFeature = calculateNumbersFeature(stateView, historyView, attackerId, defenderId);
-    	featureVector.add(numbersFeature);
+    	featureVector[3] = numbersFeature;
     	double isAttackingSelfFeature = calculateIsAttackingSelfFeature(stateView, historyView, attackerId, defenderId);
-    	featureVector.add(isAttackingSelfFeature);
+    	featureVector[4] = isAttackingSelfFeature;
     	
-    	if(featureVector.size() == this.weights.length)
-    		return toPrimitive(featureVector);
-    	else{
-    		System.err.println("Feature Vector dimension does not match Weights");
-    		System.exit(1);
-    		return null;
-    	}
-    }
-    
-    /**
-     * Simple helper function that returns the primitive array of an ArrayList of Doubles
-     * @param arraylist
-     * @return A primitive double array of the ArrayList<Double> input
-     */
-    private double[] toPrimitive(ArrayList<Double> arraylist){
-    	double[] ret = new double[arraylist.size()];
-        Iterator<Double> iterator = arraylist.iterator();
-        for (int i = 0; i < ret.length; i++)
-        {
-            ret[i] = iterator.next().intValue();
-        }
-        return ret;
+    	
+    	return featureVector;
     }
     
     /**
@@ -368,10 +604,25 @@ public class RLAgent extends Agent {
     	
     	UnitView attacker = stateView.getUnit(attackerId);
     	UnitView defender = stateView.getUnit(defenderId);
-
-        distanceFeature = Math.max(Math.abs(attacker.getXPosition() - defender.getXPosition()), Math.abs(attacker.getYPosition() - defender.getYPosition()));
     	
+    	int targetDistance = chebyshevDistance(attacker.getXPosition(), attacker.getYPosition(), defender.getXPosition(), defender.getYPosition());
+
+		int numberOfEnemiesCloser = 0;
+		for (int enemyID : enemyFootmen) {
+			UnitView enemy = stateView.getUnit(enemyID);
+			int distance = chebyshevDistance(attacker.getXPosition(),
+					attacker.getYPosition(), enemy.getXPosition(), enemy.getYPosition());
+			if (distance < targetDistance) {
+				numberOfEnemiesCloser++;
+			}
+		}
+		distanceFeature = enemyFootmen.size() - numberOfEnemiesCloser;
+		
     	return distanceFeature;
+    }
+    
+    private int chebyshevDistance(int x1, int y1, int x2, int y2){
+    	return Math.max(Math.abs(x1 - x2), Math.abs(y1 - y2));
     }
     
     /**
@@ -398,7 +649,8 @@ public class RLAgent extends Agent {
     }
     
     /**
-     * This returns the feature representing the number of ally footmen currently attacking your footman's desginated target enemy footman.
+     * This returns the feature representing the number of ally footmen currently attacking your footman's desginated target enemy footman
+     * in ratio to your remaining footmen.
      * 
      * @param stateView Current state of the SEPIA game
      * @param historyView History of the game up until this turn
@@ -413,12 +665,18 @@ public class RLAgent extends Agent {
     	double numbersFeature = 0.0;
 
     	int lastTurnNumber = stateView.getTurnNumber() - 1;
-    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(this.ENEMY_PLAYERNUM, lastTurnNumber);
+    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(RLAgent.ENEMY_PLAYERNUM, lastTurnNumber);
     	
     	for(Integer myFootman:this.myFootmen){
-    		Action action = commandsIssued.get(myFootman);
-    		action.toString();
+    		if(commandsIssued.containsKey(myFootman)){
+    			TargetedAction action = (TargetedAction) commandsIssued.get(myFootman);
+    			if(action.getTargetId() == defenderId){
+    				numbersFeature += 1.0;
+    			}
+    		}
     	}
+    	
+    	numbersFeature /= this.myFootmen.size();
     	
     	return numbersFeature;
     }
@@ -438,10 +696,12 @@ public class RLAgent extends Agent {
                                            int defenderId) {
     	double isAttackingSelfFeature = 0.0;
 
-    	int turnNumber = stateView.getTurnNumber();
-    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(this.ENEMY_PLAYERNUM, turnNumber);
-    	for(Map.Entry<Integer, Action> commandEntry : commandsIssued.entrySet()) {
-    		System.out.println("Unit " + commandEntry.getKey() + " was commanded to " + commandEntry.getValue().toString());
+    	int lastTurnNumber = stateView.getTurnNumber() - 1;
+    	Map<Integer, Action> commandsIssued = historyView.getCommandsIssued(RLAgent.ENEMY_PLAYERNUM, lastTurnNumber);
+    	if(commandsIssued.containsKey(defenderId)){
+        	TargetedAction defenderAction = (TargetedAction) commandsIssued.get(defenderId);
+        	if(defenderAction.getTargetId() == attackerId)
+        		isAttackingSelfFeature = 1.0;
     	}
     	
     	return isAttackingSelfFeature;
